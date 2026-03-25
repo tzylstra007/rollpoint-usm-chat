@@ -1,5 +1,6 @@
 // Roll Point USM Expert Chatbot — Vercel Serverless Proxy
 // Knowledge Base: Mastering USM Guide v6.04 + Mastering USM Glossary v6.04
+// v2 — auto-retry on overload_error (up to 3 attempts with backoff)
 
 const SYSTEM_PROMPT = `You are the USM Expert Assistant for Roll Point LLC, the consulting firm of Tom Zylstra — the foremost expert on the Smartsheet User Subscription Model (USM) licensing architecture and the author of the Mastering USM Guide and Companion Glossary.
 
@@ -11,7 +12,7 @@ RULES:
 - If a question is outside the scope of these documents, say so clearly and suggest scheduling a consultation at rollpointllc.com
 - Never guess or fabricate. If the answer is not in the documents, say so.
 - Be concise but thorough — visitors are Smartsheet admins, IT leaders, and procurement teams
-- End every answer with: "For deeper analysis, schedule a consultation at rollpointllc.com"
+- End every answer with exactly this sentence: "For additional insights, [schedule](https://calendly.com/rollpoint/rp60musmpstr) a complimentary initial consultation."
 - You are the Roll Point USM Expert Assistant
 
 === MASTERING USM GUIDE (v6.04) ===
@@ -7061,21 +7062,17 @@ Software X Term
 sales@thesoftwarex.com © 2025-2026 - Software X - All Rights Reserved v6.04 Page -9
 `;
 
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', 'https://www.rollpointllc.com');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+// Pause helper
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+// Call Anthropic with up to maxAttempts retries on overload
+async function callAnthropic(messages, maxAttempts = 3) {
+  const delays = [1500, 3000, 5000]; // ms to wait before each retry
 
-  try {
-    const { messages } = req.body;
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'messages array required' });
-    }
-    if (messages.length > 20) {
-      return res.status(429).json({ error: 'Conversation too long. Please start a new session.' });
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      await sleep(delays[attempt - 1]);
+      console.log(`Retry attempt ${attempt} after overload...`);
     }
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -7093,14 +7090,50 @@ export default async function handler(req, res) {
       })
     });
 
-    if (!response.ok) {
-      const error = await response.json();
-      console.error('Anthropic API error:', error);
-      return res.status(response.status).json({ error: error.error?.message || 'API error' });
+    // Success — return immediately
+    if (response.ok) {
+      return { data: await response.json(), status: 200 };
     }
 
-    const data = await response.json();
-    return res.status(200).json(data);
+    const error = await response.json();
+    const isOverloaded = error?.error?.type === 'overloaded_error';
+
+    // Only retry on overload — all other errors fail immediately
+    if (!isOverloaded || attempt === maxAttempts - 1) {
+      console.error('Anthropic API error:', error);
+      return {
+        data: { error: isOverloaded
+          ? 'The service is briefly busy — please send your question again in a moment.'
+          : (error.error?.message || 'API error')
+        },
+        status: response.status
+      };
+    }
+
+    console.log(`Overloaded on attempt ${attempt + 1}, retrying...`);
+  }
+}
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', 'https://www.rollpointllc.com');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  try {
+    const { messages } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'messages array required' });
+    }
+    if (messages.length > 20) {
+      return res.status(429).json({ error: 'Conversation too long. Please start a new session.' });
+    }
+
+    const { data, status } = await callAnthropic(messages);
+
+    return res.status(status).json(data);
 
   } catch (err) {
     console.error('Proxy error:', err);
